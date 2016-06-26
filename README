@@ -1,0 +1,17 @@
+This program hides UDP traffic as TCP traffic in order to bypass certain
+firewalls.
+
+It is not designed to bypass rigorous deep packet inspection; for example,
+there is no window scaling; all data received as UDP will be immediately
+transmitted as TCP with a fixed window size. There is also no retransmission,
+although that could be implemented (at a detriment to the overall network health).
+
+This program is intended to be C99 and POSIX compatible, and requires only
+libev. If desired, it should be easily portable to use libevent instead, as it
+uses only basic event-based programming concepts.
+
+example usage:
+    server# openvpn --proto udp --port 1194
+    server# udpintcp server localhost 11940 localhost 1194
+    client# udpintcp client localhost 1194 server 11940
+    client# openvpn --remote localhost 11940 udp
