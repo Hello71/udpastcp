@@ -43,7 +43,7 @@ static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
     hdr->th_off = 5;
 }
 
-static void s_s_cleanup(EV_P_ struct o_s_sock *sock) {
+static void s_sock_cleanup(EV_P_ struct o_s_sock *sock) {
     DBG("cleaning up socket %p", sock);
 
     if (sock->status == TCP_ESTABLISHED) {
@@ -75,7 +75,7 @@ static void s_s_cleanup(EV_P_ struct o_s_sock *sock) {
 
 static void s_tm_cb(EV_P_ ev_timer *w, int revents __attribute__((unused))) {
     DBG("timing out socket %p", w->data);
-    s_s_cleanup(EV_A_ w->data);
+    s_sock_cleanup(EV_A_ w->data);
 }
 
 static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
@@ -146,7 +146,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
 #ifdef DEBUG
     char hbuf[NI_MAXHOST];
-    r = getnameinfo(&s_data->pkt_addr, c_addrlen, hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+    r = getnameinfo((struct sockaddr *)&s_data->pkt_addr, c_addrlen, hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
     if (r) {
         fprintf(stderr, "getnameinfo: %s\n", gai_strerror(r));
         ev_break(EV_A_ EVBREAK_ONE);
@@ -203,7 +203,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             ((struct sockaddr_in *)&s_data->pkt_addr)->sin_port = htons(0);
 
             DBG("sending SYN/ACK");
-            if ((sz = sendto(w->fd, &buf, sizeof(buf), 0, &s_data->pkt_addr, s_data->s_addrlen)) == -1) {
+            if ((sz = sendto(w->fd, &buf, sizeof(buf), 0, (struct sockaddr *)&s_data->pkt_addr, s_data->s_addrlen)) == -1) {
                 perror("sendto");
                 ev_break(EV_A_ EVBREAK_ONE);
                 return;
@@ -230,7 +230,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     if (th_flags == TH_RST) {
         DBG("RST received, cleaning up socket");
         sock->status = TCP_CLOSE;
-        s_s_cleanup(EV_A_ sock);
+        s_sock_cleanup(EV_A_ sock);
     }
 
     if (th_flags & ~(TH_PUSH | TH_ACK)) {

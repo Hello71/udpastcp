@@ -27,7 +27,6 @@ struct o_c_rsock {
     struct o_c_sock *o_socks_by_lport;
     struct c_data *c_data;
     ev_io io_w;
-    ev_timer tm_w;
     UT_hash_handle hh;
     int fd;
     socklen_t r_addrlen;
@@ -43,8 +42,8 @@ struct o_c_sock {
     UT_hash_handle hh_ca;
     uint16_t seq_num;
     in_port_t l_port;
-    in_port_t r_port;
     uint8_t status;
+    int8_t syn_retries;
 };
 
 #define PORTS_IN_INT sizeof(int) * CHAR_BIT
@@ -58,9 +57,12 @@ struct c_data {
     socklen_t s_addrlen;
     unsigned int used_ports[32768 / PORTS_IN_INT];
     int s_sock;
+    int i_sock;
 };
 
 static struct c_data *global_c_data;
+
+static const uint8_t tcp_syn_retry_timeouts[] = { 3, 6, 12, 24, 0 };
 
 /* reserve a local TCP port (local addr, remote addr, remote port are usually
  * fixed in the tuple) */
@@ -102,42 +104,68 @@ static void free_port(unsigned int *used_ports, uint16_t port_num) {
     used_ports[port_num / PORTS_IN_INT] ^= 1 << (port_num % PORTS_IN_INT);
 }
 
+static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
+    if (sock->status != TCP_SYN_SENT) {
+        struct tcphdr buf = {
+            .th_sport = sock->l_port,
+            .th_dport = ((struct sockaddr_in *)sock->rsock->r_addr)->sin_port,
+            .th_seq = htonl(sock->seq_num),
+            .th_off = 5,
+            .th_flags = sock->status == TCP_ESTABLISHED ? TH_FIN : TH_RST
+        };
+
+        ssize_t sz = send(sock->rsock->c_data->s_sock, &buf, sizeof(buf), 0);
+        if (sz < 0) {
+            perror("send");
+            ev_break(EV_A_ EVBREAK_ONE);
+            return;
+        } else if ((size_t)sz != sizeof(buf)) {
+            fprintf(stderr, "send %s our packet: tried %lu, sent %zd\n", (size_t)sz > sizeof(buf) ? "expanded" : "truncated", sizeof(buf), sz);
+        }
+    }
+
+    if (!stopping) {
+        free_port(sock->rsock->c_data->used_ports, sock->l_port);
+        ev_timer_stop(EV_A_ &sock->tm_w);
+
+        HASH_DELETE(hh_lp, sock->rsock->o_socks_by_lport, sock);
+
+        if (!sock->rsock->o_socks_by_lport) {
+            close(sock->rsock->fd);
+
+            ev_io_stop(EV_A_ &sock->rsock->io_w);
+
+            HASH_DEL(sock->rsock->c_data->o_rsocks, sock->rsock);
+
+            free(sock->rsock->r_addr);
+            free(sock->rsock);
+        }
+
+        free(sock);
+    }
+}
+
 static void c_tm_cb(EV_P_ ev_timer *w, int revents __attribute__((unused))) {
-    struct o_c_sock *sock = w->data;
-    DBG("timing out socket @ %p", sock);
-    struct tcphdr buf = {
-        .th_sport = sock->l_port,
-        .th_dport = sock->r_port,
-        .th_seq = htonl(sock->seq_num),
-        .th_off = 5,
-        .th_flags = TH_FIN
-    };
-    ssize_t sz = send(sock->rsock->c_data->s_sock, &buf, sizeof(buf), 0);
-    if (sz < 0) {
-        perror("send");
-        ev_break(EV_A_ EVBREAK_ONE);
-        return;
-    } else if ((size_t)sz != sizeof(buf)) {
-        fprintf(stderr, "send %s our packet: tried %lu, sent %zd\n", (size_t)sz > sizeof(buf) ? "expanded" : "truncated", sizeof(buf), sz);
+    DBG("timing out socket %p", w->data);
+    c_sock_cleanup(EV_A_ w->data, 0);
+}
+
+static int c_adv_syn_tm(EV_P_ struct o_c_sock *sock) {
+    uint8_t next_retr = tcp_syn_retry_timeouts[sock->syn_retries++];
+    if (next_retr) {
+        ev_timer_set(&sock->tm_w, next_retr, 0.);
+        ev_timer_start(EV_A_ &sock->tm_w);
     }
-    free_port(sock->rsock->c_data->used_ports, sock->l_port);
-    ev_timer_stop(EV_A_ w);
+    return !!next_retr;
+}
 
-    HASH_DELETE(hh_lp, sock->rsock->o_socks_by_lport, sock);
-
-    if (!sock->rsock->o_socks_by_lport) {
-        close(sock->rsock->fd);
-
-        ev_io_stop(EV_A_ &sock->rsock->io_w);
-        ev_timer_stop(EV_A_ &sock->rsock->tm_w);
-
-        HASH_DEL(sock->rsock->c_data->o_rsocks, sock->rsock);
-
-        free(sock->rsock->r_addr);
-        free(sock->rsock);
+static void c_syn_tm_cb(EV_P_ ev_timer *w, int revents __attribute__((unused))) {
+    if (c_adv_syn_tm(EV_A_ w->data)) {
+        // resend SYN
+    } else {
+        DBG("connection timed out");
+        c_sock_cleanup(EV_A_ w->data, 0);
     }
-
-    free(sock);
 }
 
 static void cc_cb(struct ev_loop *loop __attribute__((unused)), ev_io *w, int revents __attribute__((unused))) {
@@ -180,7 +208,7 @@ static void cc_cb(struct ev_loop *loop __attribute__((unused)), ev_io *w, int re
 
         struct tcphdr shdr = {
             .th_sport = sock->l_port,
-            .th_dport = sock->r_port,
+            .th_dport = ((struct sockaddr_in *)sock->rsock->r_addr)->sin_port,
             .th_seq = htonl(sock->seq_num),
             .th_ack = rhdr->th_seq,
             .th_win = 65535,
@@ -214,6 +242,14 @@ static void cc_cb(struct ev_loop *loop __attribute__((unused)), ev_io *w, int re
         }
 
         free(sock->pending_data);
+
+        ev_timer_stop(EV_A_ &sock->tm_w);
+        // 10 minutes. this is not very important because UDP packets will not
+        // be lost (any more), only delayed until a new connection is established.
+        // however, it is probably a good idea to set this higher than the UDP
+        // ping delay if you are using one.
+        ev_timer_init(&sock->tm_w, c_tm_cb, 10. * 60., 10. * 60.);
+        ev_timer_start(EV_A_ &sock->tm_w);
     }
 
     should_ssz = rsz - ntohs(rhdr->th_off) * 32 / CHAR_BIT;
@@ -278,53 +314,47 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         sock->c_address = malloc(addresslen);
         memcpy(sock->c_address, &c_data->pkt_addr, addresslen);
 
-        struct o_c_rsock *rsock;
+        HASH_FIND(hh, c_data->o_rsocks, res->ai_addr, res->ai_addrlen, sock->rsock);
 
-        HASH_FIND(hh, c_data->o_rsocks, res->ai_addr, res->ai_addrlen, rsock);
-
-        if (!rsock) {
+        if (!sock->rsock) {
             DBG("could not locate remote socket to host, initializing new raw socket");
-            rsock = malloc(sizeof(*rsock));
-            rsock->r_addr = malloc(res->ai_addrlen);
+            sock->rsock = malloc(sizeof(*sock->rsock));
+            sock->rsock->r_addr = malloc(res->ai_addrlen);
 
-            memcpy(rsock->r_addr, res->ai_addr, res->ai_addrlen);
-            rsock->r_addrlen = res->ai_addrlen;
+            memcpy(sock->rsock->r_addr, res->ai_addr, res->ai_addrlen);
+            sock->rsock->r_addrlen = res->ai_addrlen;
             freeaddrinfo(res);
-            rsock->o_socks_by_lport = NULL;
-            rsock->c_data = c_data;
+            sock->rsock->o_socks_by_lport = NULL;
+            sock->rsock->c_data = c_data;
 
-            rsock->fd = socket(rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
-            if (!rsock->fd) {
+            sock->rsock->fd = socket(sock->rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
+            if (!sock->rsock->fd) {
                 perror("socket");
                 ev_break(EV_A_ EVBREAK_ONE);
                 return;
             }
 
-            if (connect(rsock->fd, rsock->r_addr, rsock->r_addrlen) == -1) {
+            if (connect(sock->rsock->fd, sock->rsock->r_addr, sock->rsock->r_addrlen) == -1) {
                 perror("connect");
                 ev_break(EV_A_ EVBREAK_ONE);
                 return;
             }
 
-            ev_io_init(&rsock->io_w, cc_cb, rsock->fd, EV_READ);
-            rsock->io_w.data = rsock;
-            ev_io_start(EV_A_ &rsock->io_w);
+            ev_io_init(&sock->rsock->io_w, cc_cb, sock->rsock->fd, EV_READ);
+            sock->rsock->io_w.data = sock->rsock;
+            ev_io_start(EV_A_ &sock->rsock->io_w);
 
-            HASH_ADD_KEYPTR(hh, c_data->o_rsocks, rsock->r_addr, rsock->r_addrlen, rsock);
+            HASH_ADD_KEYPTR(hh, c_data->o_rsocks, sock->rsock->r_addr, sock->rsock->r_addrlen, sock->rsock);
         }
 
-        sock->r_port = ((struct sockaddr_in *)rsock->r_addr)->sin_port;
-
         HASH_ADD_KEYPTR(hh_ca, c_data->o_socks_by_caddr, sock->c_address, addresslen, sock);
-        HASH_ADD(hh_lp, rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
-
-        sock->rsock = rsock;
+        HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
 
         sock->seq_num = random();
 
         struct tcphdr buf = {
             .th_sport = sock->l_port,
-            .th_dport = sock->r_port,
+            .th_dport = ((struct sockaddr_in *)sock->rsock->r_addr)->sin_port,
             .th_seq = htonl(sock->seq_num++),
             .th_flags = TH_SYN,
             .th_off = 5
@@ -335,7 +365,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         sock->pending_data_size = sz;
 
         DBG("sending SYN to remote");
-        sz = send(rsock->fd, &buf, sizeof(buf), 0);
+        sz = send(sock->rsock->fd, &buf, sizeof(buf), 0);
         if (sz < 0) {
             perror("send");
             ev_break(EV_A_ EVBREAK_ONE);
@@ -346,9 +376,10 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
         // resend SYN
 
-        //ev_timer_init(&sock->tm_w, c_tm_cb, 0., 60. * 60. * 3.);
-        //sock->tm_w.data = sock;
-        //ev_timer_start(EV_A_ &sock->tm_w);
+        ev_timer_init(&sock->tm_w, c_syn_tm_cb, 0., tcp_syn_retry_timeouts[0]);
+        sock->tm_w.data = sock;
+        sock->syn_retries = 0;
+        c_adv_syn_tm(EV_A_ sock);
 
         sock->status = TCP_SYN_SENT;
 
@@ -357,7 +388,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
     struct tcphdr tcp_hdr = {
         .th_sport = sock->l_port,
-        .th_dport = sock->r_port,
+        .th_dport = ((struct sockaddr_in *)sock->rsock->r_addr)->sin_port,
         .th_seq = htonl(sock->seq_num),
         .th_off = 5,
         .th_win = 65535,
@@ -399,14 +430,10 @@ static void c_cleanup() {
     struct o_c_sock *sock;
     for (sock = global_c_data->o_socks_by_caddr; sock != NULL; sock = sock->hh_ca.next) {
         switch (sock->status) {
-        case TCP_ESTABLISHED:
-            // send TCP FIN
-            break;
         case TCP_CLOSE:
             break;
         default:
-            ;
-            // send TCP RST
+            c_sock_cleanup(EV_DEFAULT, sock, 1);
         }
         // don't bother freeing anything because we're about to exit anyways
     }
@@ -422,7 +449,11 @@ int start_client(const char *s_host, const char *s_port, const char *r_host, con
         return 3;
     }
 
-    struct c_data c_data = { 0 };
+    struct c_data c_data = {
+        .s_addrlen = res->ai_addrlen,
+        .r_host = r_host,
+        .r_port = r_port
+    };
 
     c_data.s_sock = socket(res->ai_family, SOCK_DGRAM, 0);
     if (c_data.s_sock == -1) {
@@ -434,10 +465,6 @@ int start_client(const char *s_host, const char *s_port, const char *r_host, con
         perror("bind");
         return 2;
     }
-
-    c_data.s_addrlen = res->ai_addrlen;
-    c_data.r_host = r_host;
-    c_data.r_port = r_port;
 
     freeaddrinfo(res);
 
