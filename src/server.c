@@ -37,8 +37,8 @@ struct s_data {
 
 static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
     memset(hdr, 0, sizeof(*hdr));
-    hdr->th_sport = htons(((struct sockaddr_in *)sock->s_data->s_addr)->sin_port);
-    hdr->th_dport = htons(((struct sockaddr_in *)&sock->c_addr)->sin_port);
+    hdr->th_sport = ((struct sockaddr_in *)sock->s_data->s_addr)->sin_port;
+    hdr->th_dport = ((struct sockaddr_in *)&sock->c_addr)->sin_port;
     hdr->th_seq = htonl(sock->seq_num++);
     hdr->th_off = 5;
 }
@@ -91,7 +91,7 @@ static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         return;
     }
 
-    DBG("received %zd bytes", sz);
+    DBG("received %zd bytes matching socket %p", sz, sock);
 
     struct tcphdr hdr;
     s_prep_c_addr(sock, &hdr);
@@ -102,9 +102,12 @@ static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         { .iov_base = rbuf, .iov_len = sz }
     };
 
+    in_port_t c_port = ((struct sockaddr_in *)&sock->c_addr)->sin_port;
+    ((struct sockaddr_in *)&sock->c_addr)->sin_port = 0;
+
     struct msghdr msghdr = {
         .msg_name = &sock->c_addr,
-        .msg_namelen = sizeof(sock->c_addr),
+        .msg_namelen = sock->s_data->s_addrlen,
         .msg_iov = iovs,
         .msg_iovlen = sizeof(iovs) / sizeof(iovs[0])
     };
@@ -113,8 +116,11 @@ static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
     assert(sock->status == TCP_ESTABLISHED);
 
-    DBG("sending %zd bytes to client socket", should_send_size);
+    DBG("sending %zd bytes to client", should_send_size);
     sz = sendmsg(sock->s_data->s_sock, &msghdr, 0);
+
+    ((struct sockaddr_in *)&sock->c_addr)->sin_port = c_port;
+
     if (sz < 0) {
         perror("sendmsg");
         ev_break(EV_A_ EVBREAK_ONE);
@@ -178,13 +184,16 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     HASH_FIND(hh, s_data->o_socks_by_caddr, &s_data->pkt_addr, c_addrlen, sock);
 
     if (!sock) {
-        DBG("could not locate socket");
+        DBG("could not locate matching socket for client addr");
 
         if (th_flags == TH_SYN) {
-            DBG("packet was SYN, initializing new connection");
             sock = malloc(sizeof(*sock));
+
+            DBG("packet was SYN, initializing new connection @ %p", sock);
+
             memcpy(&sock->c_addr, &s_data->pkt_addr, c_addrlen);
 
+            sock->s_data = s_data;
             sock->seq_num = random();
             sock->c_sock = -1;
             sock->status = TCP_SYN_RECV;
@@ -239,9 +248,9 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     }
 
     if (sock->status == TCP_SYN_RECV) {
-        DBG("no UDP socket for this connection, shifting to ESTABLISHED");
-
         assert(sock->c_sock == -1);
+
+        DBG("no UDP socket for this connection, shifting to ESTABLISHED");
 
         sock->status = TCP_ESTABLISHED;
 
@@ -278,10 +287,9 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
     assert(sock->status == TCP_ESTABLISHED);
 
-    DBG("sending %zu bytes to client socket", (size_t)(sz - tcphdr->th_off * 4));
+    DBG("sending %zu bytes to client", (size_t)(sz - tcphdr->th_off * 4));
     sz = send(sock->c_sock, rbuf + tcphdr->th_off * 4, sz - tcphdr->th_off * 4, 0);
     if (sz < 0) {
-        // TODO: send TCP error?
         perror("send");
         ev_break(EV_A_ EVBREAK_ONE);
         return;

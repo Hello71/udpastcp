@@ -122,6 +122,8 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
         } else if ((size_t)sz != sizeof(buf)) {
             fprintf(stderr, "send %s our packet: tried %lu, sent %zd\n", (size_t)sz > sizeof(buf) ? "expanded" : "truncated", sizeof(buf), sz);
         }
+
+        return;
     }
 
     if (!stopping) {
@@ -252,10 +254,10 @@ static void cc_cb(struct ev_loop *loop __attribute__((unused)), ev_io *w, int re
         ev_timer_start(EV_A_ &sock->tm_w);
     }
 
-    should_ssz = rsz - ntohs(rhdr->th_off) * 32 / CHAR_BIT;
+    should_ssz = rsz - rhdr->th_off * 32 / CHAR_BIT;
     if (should_ssz > 0) {
         DBG("sending %zd bytes to client", should_ssz);
-        ssz = sendto(rsock->c_data->s_sock, rbuf + ntohs(rhdr->th_off) * 32 / CHAR_BIT, should_ssz, 0, sock->c_address, rsock->c_data->s_addrlen);
+        ssz = sendto(rsock->c_data->s_sock, rbuf + rhdr->th_off * 32 / CHAR_BIT, should_ssz, 0, sock->c_address, rsock->c_data->s_addrlen);
 
         if (ssz < 0) {
             perror("sendto");
