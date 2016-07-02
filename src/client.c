@@ -8,19 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/types.h>
-#include <sys/uio.h>
 #include <unistd.h>
-
-#ifdef CRYPTO
-#include <sodium/core.h>
-#include <sodium/crypto_secretbox.h>
-#include <sodium/randombytes.h>
-#endif
 
 #include "common.h"
 #include "client.h"
 #include "uthash.h"
+
+#define PORTS_IN_INT sizeof(int) * CHAR_BIT
 
 struct o_c_rsock {
     struct sockaddr *r_addr;
@@ -30,6 +24,7 @@ struct o_c_rsock {
     UT_hash_handle hh;
     int fd;
     socklen_t r_addrlen;
+    unsigned int used_ports[32768 / PORTS_IN_INT];
 };
 
 struct o_c_sock {
@@ -46,8 +41,6 @@ struct o_c_sock {
     int8_t syn_retries;
 };
 
-#define PORTS_IN_INT sizeof(int) * CHAR_BIT
-
 struct c_data {
     const char *r_host;
     const char *r_port;
@@ -55,7 +48,6 @@ struct c_data {
     struct o_c_rsock *o_rsocks;
     struct sockaddr_storage pkt_addr;
     socklen_t s_addrlen;
-    unsigned int used_ports[32768 / PORTS_IN_INT];
     int s_sock;
     int i_sock;
 };
@@ -64,14 +56,35 @@ static struct c_data *global_c_data;
 
 static const uint8_t tcp_syn_retry_timeouts[] = { 3, 6, 12, 24, 0 };
 
+static inline int check_resv_port(unsigned int *used_ports, uint16_t port) {
+    if (used_ports[port / PORTS_IN_INT] & (1 << port % PORTS_IN_INT)) {
+        used_ports[port / PORTS_IN_INT] |= 1 << port % PORTS_IN_INT;
+        return port;
+    }
+    return 0;
+}
+
 /* reserve a local TCP port (local addr, remote addr, remote port are usually
  * fixed in the tuple) */
 static uint16_t reserve_port(unsigned int *used_ports) {
-    // pick a starting port for the search
-    uint16_t spoff = random() % 32768;
-    size_t smoff = spoff / PORTS_IN_INT;
-    unsigned int ioff;
-    size_t moff;
+    uint16_t port;
+    // randomly try 16 places
+    for (int i = 1; i <= 16; i++) {
+        long r = random();
+
+        port = 32768 + r;
+        if (check_resv_port(used_ports, port))
+            return port;
+
+        port = 32768 + (r << 16);
+        if (check_resv_port(used_ports, port))
+            return port;
+    }
+
+    // give up and go sequentially
+
+    uint16_t ioff, spoff = port;
+    size_t moff, smoff = spoff / PORTS_IN_INT;
 
     /* two step process:
      * +-----------------------------+-----------------------+
@@ -127,7 +140,7 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
     }
 
     if (!stopping) {
-        free_port(sock->rsock->c_data->used_ports, sock->l_port);
+        free_port(sock->rsock->used_ports, sock->l_port);
         ev_timer_stop(EV_A_ &sock->tm_w);
 
         HASH_DELETE(hh_lp, sock->rsock->o_socks_by_lport, sock);
@@ -170,7 +183,7 @@ static void c_syn_tm_cb(EV_P_ ev_timer *w, int revents __attribute__((unused))) 
     }
 }
 
-static void cc_cb(struct ev_loop *loop __attribute__((unused)), ev_io *w, int revents __attribute__((unused))) {
+static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unused))) {
     DBG("-- entering cc_cb --");
 
     struct o_c_rsock *rsock = w->data;
@@ -294,15 +307,6 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         DBG("could not locate matching socket for client, initializing new connection");
         sock = calloc(1, sizeof(*sock));
 
-        uint16_t l_port = reserve_port(c_data->used_ports);
-        DBG("using port %hu", l_port);
-        if (!l_port) {
-            fputs("we ran out of ports?\n", stderr);
-            ev_break(EV_A_ EVBREAK_ONE);
-            return;
-        }
-        sock->l_port = htons(l_port);
-
         struct addrinfo *res;
         DBG("looking up %s:%s", c_data->r_host, c_data->r_port);
         // TODO: make this asynchronous
@@ -348,6 +352,15 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
             HASH_ADD_KEYPTR(hh, c_data->o_rsocks, sock->rsock->r_addr, sock->rsock->r_addrlen, sock->rsock);
         }
+
+        uint16_t l_port = reserve_port(sock->rsock->used_ports);
+        DBG("using port %hu", l_port);
+        if (!l_port) {
+            fputs("we ran out of ports?\n", stderr);
+            ev_break(EV_A_ EVBREAK_ONE);
+            return;
+        }
+        sock->l_port = htons(l_port);
 
         HASH_ADD_KEYPTR(hh_ca, c_data->o_socks_by_caddr, sock->c_address, addresslen, sock);
         HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
