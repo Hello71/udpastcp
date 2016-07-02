@@ -10,7 +10,7 @@ This program is intended to be C99 and POSIX compatible, and requires only
 libev. If desired, it should be easily portable to use libevent instead, as it
 uses only basic event-based programming concepts.
 
-example usage:
+Example usage:
     server# openvpn --proto udp --port 1194
     server# udpintcp server localhost 11940 localhost 1194
     client# udpintcp client localhost 1194 server 11940
