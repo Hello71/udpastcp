@@ -56,10 +56,10 @@ static struct c_data *global_c_data;
 
 static const uint8_t tcp_syn_retry_timeouts[] = { 3, 6, 12, 24, 0 };
 
-static inline int check_resv_port(unsigned int *used_ports, uint16_t port) {
-    if (used_ports[port / PORTS_IN_INT] & (1 << port % PORTS_IN_INT)) {
-        used_ports[port / PORTS_IN_INT] |= 1 << port % PORTS_IN_INT;
-        return port;
+static inline int check_resv_poff(unsigned int *used_ports, uint16_t poff) {
+    if (used_ports[poff / PORTS_IN_INT] & (1 << poff % PORTS_IN_INT)) {
+        used_ports[poff / PORTS_IN_INT] |= 1 << poff % PORTS_IN_INT;
+        return poff;
     }
     return 0;
 }
@@ -67,23 +67,22 @@ static inline int check_resv_port(unsigned int *used_ports, uint16_t port) {
 /* reserve a local TCP port (local addr, remote addr, remote port are usually
  * fixed in the tuple) */
 static uint16_t reserve_port(unsigned int *used_ports) {
-    uint16_t port;
+    long r;
+
     // randomly try 16 places
     for (int i = 1; i <= 16; i++) {
-        long r = random();
+        r = random();
 
-        port = 32768 + r;
-        if (check_resv_port(used_ports, port))
-            return port;
+        if (check_resv_poff(used_ports, r % 32768))
+            return 32768 + r;
 
-        port = 32768 + (r << 16);
-        if (check_resv_port(used_ports, port))
-            return port;
+        if (check_resv_poff(used_ports, (r >> 16) % 32768))
+            return 32768 + (r >> 16);
     }
 
     // give up and go sequentially
 
-    uint16_t ioff, spoff = port;
+    uint16_t ioff, spoff = (r >> 16) + 1;
     size_t moff, smoff = spoff / PORTS_IN_INT;
 
     /* two step process:
@@ -325,6 +324,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         if (!sock->rsock) {
             DBG("could not locate remote socket to host, initializing new raw socket");
             sock->rsock = malloc(sizeof(*sock->rsock));
+            memset(&sock->rsock->used_ports, 0, sizeof(sock->rsock->used_ports));
             sock->rsock->r_addr = malloc(res->ai_addrlen);
 
             memcpy(sock->rsock->r_addr, res->ai_addr, res->ai_addrlen);
