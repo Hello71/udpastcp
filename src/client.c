@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "checksum.h"
 #include "client.h"
 #include "uthash.h"
 
@@ -20,11 +21,12 @@ struct o_c_rsock {
     struct sockaddr *r_addr;
     struct o_c_sock *o_socks_by_lport;
     struct c_data *c_data;
+    unsigned int used_ports[32768 / PORTS_IN_INT];
     ev_io io_w;
     UT_hash_handle hh;
     int fd;
+    uint16_t csum_a;
     socklen_t r_addrlen;
-    unsigned int used_ports[32768 / PORTS_IN_INT];
 };
 
 struct o_c_sock {
@@ -281,6 +283,47 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
     }
 }
 
+#define SIX_OR_FOUR(sa, six, four, neither) \
+    (((struct sockaddr *)(sa))->sa_family == AF_INET6 ? (six) : ((struct sockaddr *)(sa))->sa_family == AF_INET ? (four) : abort(), neither)
+
+#define EXTRACT_IN_ADDR(sa) \
+    SIX_OR_FOUR((struct sockaddr *)(sa), &(((struct sockaddr_in6 *)(sa))->sin6_addr), &(((struct sockaddr_in *)(sa))->sin_addr), NULL), \
+    SIX_OR_FOUR((struct sockaddr *)(sa), sizeof(struct in6_addr), sizeof(in_addr_t), 0)
+
+static int c_rsock_init(struct o_c_sock *sock, struct addrinfo *res) {
+    sock->rsock = malloc(sizeof(*sock->rsock));
+    memset(&sock->rsock->used_ports, 0, sizeof(sock->rsock->used_ports));
+    sock->rsock->r_addr = malloc(res->ai_addrlen);
+
+    memcpy(sock->rsock->r_addr, res->ai_addr, res->ai_addrlen);
+    sock->rsock->r_addrlen = res->ai_addrlen;
+    freeaddrinfo(res);
+    sock->rsock->o_socks_by_lport = NULL;
+
+    sock->rsock->fd = socket(sock->rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
+    if (!sock->rsock->fd) {
+        perror("socket");
+        return 0;
+    }
+
+    if (connect(sock->rsock->fd, sock->rsock->r_addr, sock->rsock->r_addrlen) == -1) {
+        perror("connect");
+        return 0;
+    }
+
+    struct sockaddr_storage our_addr;
+    socklen_t our_addr_len = sizeof(our_addr);
+    int r = getsockname(sock->rsock->fd, (struct sockaddr *)&our_addr, &our_addr_len);
+    if (r == -1) {
+        perror("getsockname");
+        return 0;
+    }
+
+    //sock->rsock->csum_a = csum_partial(EXTRACT_IN_ADDR(sock->rsock->r_addr), csum_partial(EXTRACT_IN_ADDR(&our_addr), 0));
+
+    return 1;
+}
+
 static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     DBG("-- entering cs_cb --");
     struct c_data *c_data = w->data;
@@ -323,28 +366,11 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
         if (!sock->rsock) {
             DBG("could not locate remote socket to host, initializing new raw socket");
-            sock->rsock = malloc(sizeof(*sock->rsock));
-            memset(&sock->rsock->used_ports, 0, sizeof(sock->rsock->used_ports));
-            sock->rsock->r_addr = malloc(res->ai_addrlen);
-
-            memcpy(sock->rsock->r_addr, res->ai_addr, res->ai_addrlen);
-            sock->rsock->r_addrlen = res->ai_addrlen;
-            freeaddrinfo(res);
-            sock->rsock->o_socks_by_lport = NULL;
+            if (!c_rsock_init(sock, res)) {
+                ev_break(EV_A_ EVBREAK_ONE);
+                return;
+            }
             sock->rsock->c_data = c_data;
-
-            sock->rsock->fd = socket(sock->rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
-            if (!sock->rsock->fd) {
-                perror("socket");
-                ev_break(EV_A_ EVBREAK_ONE);
-                return;
-            }
-
-            if (connect(sock->rsock->fd, sock->rsock->r_addr, sock->rsock->r_addrlen) == -1) {
-                perror("connect");
-                ev_break(EV_A_ EVBREAK_ONE);
-                return;
-            }
 
             ev_io_init(&sock->rsock->io_w, cc_cb, sock->rsock->fd, EV_READ);
             sock->rsock->io_w.data = sock->rsock;
