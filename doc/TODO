@@ -1,13 +1,9 @@
-- FIN open TCP connections on exit
-
 - add 'TCP Fast Open' support
 
 - optionally return ACKs and retransmit if no ACK
 
 - change some of the tiny hash tables to linked lists
 
-- allow more than 32768 connections to multiple hosts?
-
-- add fake TCP options?
+- add fake TCP options
 
 - add Windows support (not likely)
