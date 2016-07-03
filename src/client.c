@@ -128,7 +128,7 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
             .th_flags = sock->status == TCP_ESTABLISHED ? TH_FIN : TH_RST
         };
 
-        ssize_t sz = send(sock->rsock->c_data->s_sock, &buf, sizeof(buf), 0);
+        ssize_t sz = send(sock->rsock->fd, &buf, sizeof(buf), 0);
         if (sz < 0) {
             perror("send");
             ev_break(EV_A_ EVBREAK_ONE);
@@ -260,10 +260,10 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
         free(sock->pending_data);
 
         ev_timer_stop(EV_A_ &sock->tm_w);
-        // 10 minutes. this is not very important because UDP packets will not
-        // be lost (any more), only delayed until a new connection is established.
-        // however, it is probably a good idea to set this higher than the UDP
-        // ping delay if you are using one.
+        // this delay is not very important because one, it is OK if UDP
+        // packets are lost, and two, they are only delayed until a new
+        // connection is established. however, it is probably a good idea to
+        // set this higher than the UDP ping delay if you are using one.
         ev_timer_init(&sock->tm_w, c_tm_cb, 10. * 60., 10. * 60.);
         ev_timer_start(EV_A_ &sock->tm_w);
     }
