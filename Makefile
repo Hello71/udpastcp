@@ -1,9 +1,9 @@
-CFLAGS += -Wall -Wextra -flto
+CFLAGS += -Wall -Wextra
 
 LDLIBS := -lev
 
 NET_OBJS := src/client.o src/server.o
-OBJS := src/udpastcp.o $(NET_OBJS)
+OBJS := src/udpastcp.o src/checksum.o $(NET_OBJS)
 
 udpastcp: $(OBJS)
 	$(LINK.c) $^ $(LOADLIBES) $(LDLIBS) -o $@

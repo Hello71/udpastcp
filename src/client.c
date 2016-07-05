@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <errno.h>
 #include <ev.h>
 #include <fcntl.h>
@@ -17,7 +18,19 @@
 #include "client.h"
 #include "uthash.h"
 
-#define PORTS_IN_INT sizeof(int) * CHAR_BIT
+#define PORTS_IN_INT (sizeof(int) * CHAR_BIT)
+
+struct c_data {
+    const char *r_host;
+    const char *r_port;
+    struct o_c_sock *o_socks_by_caddr;
+    struct o_c_rsock *o_rsocks;
+    struct sockaddr_storage pkt_addr;
+    int s_sock;
+    int i_sock;
+    socklen_t s_addrlen;
+    uint16_t csum_p;
+};
 
 struct o_c_rsock {
     struct sockaddr *r_addr;
@@ -27,8 +40,8 @@ struct o_c_rsock {
     ev_io io_w;
     UT_hash_handle hh;
     int fd;
-    uint16_t csum_a;
     socklen_t r_addrlen;
+    uint16_t csum_p;
 };
 
 struct o_c_sock {
@@ -39,21 +52,11 @@ struct o_c_sock {
     ev_timer tm_w;
     UT_hash_handle hh_lp;
     UT_hash_handle hh_ca;
+    uint16_t csum_p;
     uint16_t seq_num;
     in_port_t l_port;
     uint8_t status;
     int8_t syn_retries;
-};
-
-struct c_data {
-    const char *r_host;
-    const char *r_port;
-    struct o_c_sock *o_socks_by_caddr;
-    struct o_c_rsock *o_rsocks;
-    struct sockaddr_storage pkt_addr;
-    socklen_t s_addrlen;
-    int s_sock;
-    int i_sock;
 };
 
 static struct c_data *global_c_data;
@@ -61,16 +64,15 @@ static struct c_data *global_c_data;
 static const uint8_t tcp_syn_retry_timeouts[] = { 3, 6, 12, 24, 0 };
 
 static inline int check_resv_poff(unsigned int *used_ports, uint16_t poff) {
-    if (used_ports[poff / PORTS_IN_INT] & (1 << poff % PORTS_IN_INT)) {
-        used_ports[poff / PORTS_IN_INT] |= 1 << poff % PORTS_IN_INT;
-        return poff;
-    }
-    return 0;
+    if (used_ports[poff / PORTS_IN_INT] & (1 << (poff % PORTS_IN_INT)))
+        return 0;
+    used_ports[poff / PORTS_IN_INT] |= 1 << (poff % PORTS_IN_INT);
+    return poff;
 }
 
 /* reserve a local TCP port (local addr, remote addr, remote port are usually
  * fixed in the tuple) */
-static uint16_t reserve_port(unsigned int *used_ports) {
+static inline uint16_t reserve_port(unsigned int *used_ports) {
     long r;
 
     // randomly try 16 places
@@ -78,10 +80,10 @@ static uint16_t reserve_port(unsigned int *used_ports) {
         r = random();
 
         if (check_resv_poff(used_ports, r % 32768))
-            return 32768 + r;
+            return 32768 + (r % 32768);
 
         if (check_resv_poff(used_ports, (r >> 16) % 32768))
-            return 32768 + (r >> 16);
+            return 32768 + ((r >> 16) % 32768);
     }
 
     // give up and go sequentially
@@ -285,50 +287,63 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
     }
 }
 
-#define SIX_OR_FOUR(sa, six, four, neither) \
-    (((struct sockaddr *)(sa))->sa_family == AF_INET6 ? (six) : ((struct sockaddr *)(sa))->sa_family == AF_INET ? (four) : abort(), neither)
+static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
+    struct o_c_rsock *rsock;
+    rsock = malloc(sizeof(*rsock));
+    memset(&rsock->used_ports, 0, sizeof(rsock->used_ports));
+    rsock->r_addr = malloc(res->ai_addrlen);
 
-#define EXTRACT_IN_ADDR(sa) \
-    SIX_OR_FOUR((struct sockaddr *)(sa), &(((struct sockaddr_in6 *)(sa))->sin6_addr), &(((struct sockaddr_in *)(sa))->sin_addr), NULL), \
-    SIX_OR_FOUR((struct sockaddr *)(sa), sizeof(struct in6_addr), sizeof(in_addr_t), 0)
-
-static int c_rsock_init(struct o_c_sock *sock, struct addrinfo *res) {
-    sock->rsock = malloc(sizeof(*sock->rsock));
-    memset(&sock->rsock->used_ports, 0, sizeof(sock->rsock->used_ports));
-    sock->rsock->r_addr = malloc(res->ai_addrlen);
-
-    memcpy(sock->rsock->r_addr, res->ai_addr, res->ai_addrlen);
-    sock->rsock->r_addrlen = res->ai_addrlen;
+    memcpy(rsock->r_addr, res->ai_addr, res->ai_addrlen);
+    rsock->r_addrlen = res->ai_addrlen;
     freeaddrinfo(res);
-    sock->rsock->o_socks_by_lport = NULL;
+    rsock->o_socks_by_lport = NULL;
 
-    sock->rsock->fd = socket(sock->rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
-    if (!sock->rsock->fd) {
+    rsock->fd = socket(rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
+    if (!rsock->fd) {
         perror("socket");
-        return 0;
+        return NULL;
     }
 
-    if (connect(sock->rsock->fd, sock->rsock->r_addr, sock->rsock->r_addrlen) == -1) {
+    if (connect(rsock->fd, rsock->r_addr, rsock->r_addrlen) == -1) {
         perror("connect");
-        return 0;
+        return NULL;
     }
 
-    if (fcntl(sock->rsock->fd, F_SETFL, O_NONBLOCK) == -1) {
+    if (fcntl(rsock->fd, F_SETFL, O_NONBLOCK) == -1) {
         perror("fcntl");
-        return 0;
+        return NULL;
     }
 
     struct sockaddr_storage our_addr;
     socklen_t our_addr_len = sizeof(our_addr);
-    int r = getsockname(sock->rsock->fd, (struct sockaddr *)&our_addr, &our_addr_len);
+    int r = getsockname(rsock->fd, (struct sockaddr *)&our_addr, &our_addr_len);
     if (r == -1) {
         perror("getsockname");
-        return 0;
+        return NULL;
     }
 
-    //sock->rsock->csum_a = csum_partial(EXTRACT_IN_ADDR(sock->rsock->r_addr), csum_partial(EXTRACT_IN_ADDR(&our_addr), 0));
+    char proto[] = { 0, IPPROTO_TCP };
 
-    return 1;
+    if (((struct sockaddr *)rsock->r_addr)->sa_family != our_addr.ss_family)
+        abort();
+
+    switch (our_addr.ss_family) {
+    case AF_INET:
+        rsock->csum_p = csum_partial(&((struct sockaddr_in *)&our_addr)->sin_addr, sizeof(in_addr_t),
+                csum_partial(&((struct sockaddr_in *)rsock->r_addr)->sin_addr, sizeof(in_addr_t), 0));
+        break;
+    case AF_INET6:
+        rsock->csum_p = csum_partial(&((struct sockaddr_in6 *)&our_addr)->sin6_addr, sizeof(struct in6_addr),
+                csum_partial(&((struct sockaddr_in6 *)rsock->r_addr)->sin6_addr, sizeof(struct in6_addr), 0));
+        break;
+    default:
+        abort();
+    }
+
+    rsock->csum_p = csum_partial(&((struct sockaddr_in *)rsock->r_addr)->sin_port, sizeof(in_port_t),
+            csum_partial(proto, sizeof(proto), rsock->csum_p));
+
+    return rsock;
 }
 
 static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
@@ -368,7 +383,8 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
             if (!sock->rsock) {
                 DBG("could not locate remote socket to host, initializing new raw socket");
-                if (!c_rsock_init(sock, res)) {
+                sock->rsock = c_rsock_init(res);
+                if (!sock->rsock) {
                     ev_break(EV_A_ EVBREAK_ONE);
                     return;
                 }
@@ -382,6 +398,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             }
 
             uint16_t l_port = reserve_port(sock->rsock->used_ports);
+            assert(l_port >= 32768);
             DBG("using port %hu", l_port);
             if (!l_port) {
                 fputs("we ran out of ports?\n", stderr);
@@ -389,6 +406,8 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                 return;
             }
             sock->l_port = htons(l_port);
+
+            sock->csum_p = csum_partial(&sock->l_port, sizeof(in_port_t), sock->rsock->csum_p);
 
             HASH_ADD_KEYPTR(hh_ca, c_data->o_socks_by_caddr, sock->c_address, addresslen, sock);
             HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
@@ -398,10 +417,12 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             struct tcphdr buf = {
                 .th_sport = sock->l_port,
                 .th_dport = ((struct sockaddr_in *)sock->rsock->r_addr)->sin_port,
-                .th_seq = htonl(sock->seq_num++),
+                .th_seq = htonl(sock->seq_num),
                 .th_flags = TH_SYN,
-                .th_off = 5
+                .th_off = 5,
             };
+            uint16_t tsz = htons(sizeof(buf));
+            buf.th_sum = ~csum_partial(&buf.th_seq, 16, csum_partial(&tsz, sizeof(tsz), sock->csum_p));
 
             sock->pending_data = malloc(sz);
             memcpy(sock->pending_data, rbuf, sz);
