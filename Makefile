@@ -1,4 +1,4 @@
-CFLAGS += -Wall -Wextra
+CFLAGS += -Wall -Wextra -Wwrite-strings -std=c99 -D_BSD_SOURCE -D_DEFAULT_SOURCE
 
 LDLIBS := -lev
 

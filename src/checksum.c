@@ -31,21 +31,24 @@
 
 /* Based on code from the Linux kernel. */
 
+#include <assert.h>
+#include <endian.h>
 #include <stdint.h>
+#include "checksum.h"
 
 /* Revised by Kenneth Albanowski for m68knommu. Basic problem: unaligned access
  kills, so most of the assembly has to go. */
 
-static inline unsigned short from32to16(unsigned int x)
+static inline uint16_t from32to16(uint32_t x)
 {
 	/* add up 16-bit and 16-bit for 16+c bit */
 	x = (x & 0xffff) + (x >> 16);
 	/* add up carry.. */
 	x = (x & 0xffff) + (x >> 16);
-	return x;
+	return (uint16_t)x;
 }
 
-static unsigned int do_csum(const unsigned char *buff, int len)
+static uint16_t do_csum(const unsigned char *buff, int len)
 {
 	int odd;
 	unsigned int result = 0;
@@ -55,24 +58,26 @@ static unsigned int do_csum(const unsigned char *buff, int len)
 	odd = 1 & (unsigned long) buff;
 	if (odd) {
 #if __BYTE_ORDER == __LITTLE_ENDIAN
-		result += (*buff << 8);
+		result += ((unsigned int)(*buff) << 8);
 #else
 		result = *buff;
 #endif
 		len--;
 		buff++;
 	}
+        assert(!((unsigned long)buff & 1));
 	if (len >= 2) {
-		if (2 & (unsigned long) buff) {
-			result += *(unsigned short *) buff;
+		if (2 & (const unsigned long) buff) {
+			result += *(const unsigned short *) buff;
 			len -= 2;
 			buff += 2;
 		}
+                assert(!((unsigned long)buff & 2));
 		if (len >= 4) {
-			const unsigned char *end = buff + ((unsigned)len & ~3);
+			const unsigned char *end = buff + ((unsigned)len & ~3u);
 			unsigned int carry = 0;
 			do {
-				unsigned int w = *(unsigned int *) buff;
+				unsigned int w = *(const unsigned int *) buff;
 				buff += 4;
 				result += carry;
 				result += w;
@@ -82,7 +87,7 @@ static unsigned int do_csum(const unsigned char *buff, int len)
 			result = (result & 0xffff) + (result >> 16);
 		}
 		if (len & 2) {
-			result += *(unsigned short *) buff;
+			result += *(const unsigned short *) buff;
 			buff += 2;
 		}
 	}
@@ -96,7 +101,7 @@ static unsigned int do_csum(const unsigned char *buff, int len)
 	if (odd)
 		result = ((result >> 8) & 0xff) | ((result & 0xff) << 8);
 out:
-	return result;
+	return (uint16_t)result;
 }
 
 /*
