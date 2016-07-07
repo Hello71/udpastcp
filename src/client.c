@@ -180,6 +180,7 @@ static int c_send_syn(struct o_c_sock *sock) {
         .th_flags = TH_SYN
     };
     c_prep_s_addr(sock, &buf);
+    sock->seq_num++;
 
     uint16_t tsz = htons(sizeof(buf));
     buf.th_sum = ~csum_partial(&buf.th_seq, 16, csum_partial(&tsz, sizeof(tsz), sock->csum_p));
