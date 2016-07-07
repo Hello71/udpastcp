@@ -42,7 +42,6 @@ struct s_data {
 };
 
 static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
-    memset(hdr, 0, sizeof(*hdr));
     hdr->th_sport = ((struct sockaddr_in *)sock->s_data->s_addr)->sin_port;
     hdr->th_dport = ((struct sockaddr_in *)&sock->c_addr)->sin_port;
     hdr->th_seq = htonl(sock->seq_num++);
@@ -54,9 +53,10 @@ static void s_sock_cleanup(EV_P_ struct o_s_sock *sock) {
 
     if (sock->status == TCP_ESTABLISHED) {
         DBG("socket was ESTABLISHED, sending FIN");
-        struct tcphdr buf;
+        struct tcphdr buf = {
+            .th_flags = TH_FIN
+        };
         s_prep_c_addr(sock, &buf);
-        buf.th_flags = TH_FIN;
         ssize_t sz;
         if ((sz = sendto(sock->s_data->s_sock, &buf, sizeof(buf), 0, (struct sockaddr *)&sock->s_data->pkt_addr, sock->s_data->s_addrlen)) == -1) {
             perror("sendto");
@@ -94,9 +94,11 @@ static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     while ((sz = recv(w->fd, rbuf, sizeof(rbuf), 0)) > 0) {
         DBG("received %zd bytes matching socket %p", sz, sock);
 
-        struct tcphdr hdr;
+        struct tcphdr hdr = {
+            .th_win = htons(65535),
+            .th_flags = TH_PUSH
+        };
         s_prep_c_addr(sock, &hdr);
-        hdr.th_off = 5;
 
         struct iovec iovs[2] = {
             { .iov_base = &hdr, .iov_len = sizeof(hdr) },
@@ -114,6 +116,9 @@ static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         };
 
         size_t should_send_size = sizeof(hdr) + sz;
+
+        uint16_t tsz = htons(sizeof(hdr) + sz);
+        hdr.th_sum = ~csum_partial(rbuf, sz, csum_partial(&hdr.th_seq, 16, csum_partial(&tsz, sizeof(tsz), sock->csum_p)));
 
         assert(sock->status == TCP_ESTABLISHED);
 
@@ -225,13 +230,11 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                 sock->csum_p = csum_sockaddr_partial((struct sockaddr *)&s_data->pkt_addr, 1, s_data->csum_p);
 
                 struct tcphdr buf = {
-                    .th_sport = tcphdr->th_dport,
-                    .th_dport = tcphdr->th_sport,
                     .th_seq = htonl(sock->seq_num),
                     .th_ack = tcphdr->th_seq,
-                    .th_flags = TH_SYN | TH_ACK,
-                    .th_off = 5
+                    .th_flags = TH_SYN | TH_ACK
                 };
+                s_prep_c_addr(sock, &buf);
 
                 uint16_t tsz = htons(sizeof(buf));
                 buf.th_sum = ~csum_partial(&buf.th_seq, 16, csum_partial(&tsz, sizeof(tsz), sock->csum_p));
