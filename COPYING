@@ -1,0 +1,9 @@
+This program is copyright Alex Xu, aka Hello71, and is made available under the
+terms of the GNU General Public License version 3.0, except where otherwise
+noted. A copy is provided in the LICENSE file.
+
+src/checksum.c is based on code from the Linux kernel and as such is made
+available under the GNU GPL version 2.0.
+
+src/uthash.h is verbatim from https://github.com/troydhanson/uthash and is thus
+made available under the terms stated in that file.
