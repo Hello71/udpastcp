@@ -35,6 +35,9 @@
 #include <endian.h>
 #include <netinet/in.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+
 #include "checksum.h"
 
 /* Revised by Kenneth Albanowski for m68knommu. Basic problem: unaligned access

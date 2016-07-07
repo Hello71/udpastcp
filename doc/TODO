@@ -1,8 +1,14 @@
+- verify checksums
+
+- add LD_PRELOAD support
+
 - add 'TCP Fast Open' support
 
 - optionally return ACKs and retransmit if no ACK
 
 - change some of the tiny hash tables to linked lists
+
+- add pcap support
 
 - add fake TCP options
 

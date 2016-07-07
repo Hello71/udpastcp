@@ -5,3 +5,5 @@
 #endif
 
 #define IN_ADDR_PORT(addr) (((struct sockaddr_in *)addr)->sin_port)
+
+extern int free_mem_on_exit;

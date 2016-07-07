@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,8 @@ struct s_data {
     uint16_t csum_p;
 };
 
+struct s_data *global_s_data;
+
 static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
     hdr->th_sport = ((struct sockaddr_in *)sock->s_data->s_addr)->sin_port;
     hdr->th_dport = ((struct sockaddr_in *)&sock->c_addr)->sin_port;
@@ -48,7 +51,7 @@ static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
     hdr->th_off = 5;
 }
 
-static void s_sock_cleanup(EV_P_ struct o_s_sock *sock) {
+static void s_sock_cleanup(EV_P_ struct o_s_sock *sock, int stopping) {
     DBG("cleaning up socket %p", sock);
 
     if (sock->status == TCP_ESTABLISHED) {
@@ -58,7 +61,9 @@ static void s_sock_cleanup(EV_P_ struct o_s_sock *sock) {
         };
         s_prep_c_addr(sock, &buf);
         ssize_t sz;
-        if ((sz = sendto(sock->s_data->s_sock, &buf, sizeof(buf), 0, (struct sockaddr *)&sock->s_data->pkt_addr, sock->s_data->s_addrlen)) == -1) {
+        // don't need to save the real port because we're deleting the sock anyways
+        ((struct sockaddr_in *)&sock->c_addr)->sin_port = htons(0);
+        if ((sz = sendto(sock->s_data->s_sock, &buf, sizeof(buf), 0, (struct sockaddr *)&sock->c_addr, sock->s_data->s_addrlen)) == -1) {
             perror("sendto");
             ev_break(EV_A_ EVBREAK_ONE);
             return;
@@ -67,21 +72,26 @@ static void s_sock_cleanup(EV_P_ struct o_s_sock *sock) {
         }
     }
 
-    if (sock->c_sock != -1) {
-        close(sock->c_sock);
+    if (!stopping || free_mem_on_exit) {
+        DBG("freeing associated resources");
+
+        if (sock->c_sock != -1) {
+            close(sock->c_sock);
+        }
+
+        ev_timer_stop(EV_A_ &sock->tm_w);
+        if (sock->status == TCP_ESTABLISHED)
+            ev_io_stop(EV_A_ &sock->io_w);
+
+        HASH_DEL(sock->s_data->o_socks_by_caddr, sock);
+
+        free(sock);
     }
-
-    ev_timer_stop(EV_A_ &sock->tm_w);
-    ev_io_stop(EV_A_ &sock->io_w);
-
-    HASH_DEL(sock->s_data->o_socks_by_caddr, sock);
-
-    free(sock);
 }
 
 static void s_tm_cb(EV_P_ ev_timer *w, int revents __attribute__((unused))) {
     DBG("timing out socket %p", w->data);
-    s_sock_cleanup(EV_A_ w->data);
+    s_sock_cleanup(EV_A_ w->data, 0);
 }
 
 static void sc_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
@@ -346,6 +356,25 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
     }
 }
 
+/* atexit cleanup */
+static void s_cleanup() {
+    if (!global_s_data)
+        return;
+
+    DBG("cleaning up");
+    struct o_s_sock *sock, *tmp;
+    HASH_ITER(hh, global_s_data->o_socks_by_caddr, sock, tmp) {
+        s_sock_cleanup(EV_DEFAULT, sock, 1);
+    }
+
+    global_s_data = NULL;
+}
+
+static void s_finish(EV_P_ ev_signal *w __attribute__((unused)), int revents __attribute__((unused))) {
+    s_cleanup();
+    ev_break(EV_A_ EVBREAK_ALL);
+}
+
 int start_server(const char *s_host, const char *s_port, const char *r_host, const char *r_port) {
     struct addrinfo *res;
     int r = getaddrinfo(s_host, s_port, NULL, &res);
@@ -383,16 +412,28 @@ int start_server(const char *s_host, const char *s_port, const char *r_host, con
         return 1;
     }
 
+    global_s_data = &s_data;
+
     struct ev_loop *loop = EV_DEFAULT;
     ev_io s_watcher;
+    ev_signal iwatcher, twatcher;
 
     ev_io_init(&s_watcher, ss_cb, s_data.s_sock, EV_READ);
     ev_io_start(EV_A_ &s_watcher);
+    ev_signal_init(&iwatcher, s_finish, SIGINT);
+    ev_signal_start(loop, &iwatcher);
+    ev_signal_init(&twatcher, s_finish, SIGTERM);
+    ev_signal_start(loop, &twatcher);
 
     s_watcher.data = &s_data;
 
     DBG("initialization complete, starting event loop");
     r = ev_run(loop, 0);
+
+    s_cleanup();
+
+    if (free_mem_on_exit)
+        ev_loop_destroy(loop);
 
     freeaddrinfo(res);
 

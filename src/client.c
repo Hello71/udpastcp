@@ -7,6 +7,7 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +34,7 @@ struct c_data {
 };
 
 struct o_c_rsock {
-    struct sockaddr *r_addr;
+    struct sockaddr_storage r_addr;
     struct o_c_sock *o_socks_by_lport;
     struct c_data *c_data;
     unsigned int used_ports[32768 / PORTS_IN_INT];
@@ -45,7 +46,7 @@ struct o_c_rsock {
 };
 
 struct o_c_sock {
-    struct sockaddr *c_address;
+    struct sockaddr_storage c_address;
     struct o_c_rsock *rsock;
     char *pending_data;
     size_t pending_data_size;
@@ -124,13 +125,14 @@ static void free_port(unsigned int *used_ports, uint16_t port_num) {
 /* prepare server address in TCP header format */
 static void c_prep_s_addr(struct o_c_sock *sock, struct tcphdr *hdr) {
     hdr->th_sport = sock->l_port;
-    hdr->th_dport = IN_ADDR_PORT(sock->rsock->r_addr);
+    hdr->th_dport = IN_ADDR_PORT(&sock->rsock->r_addr);
     hdr->th_seq = htonl(sock->seq_num);
     hdr->th_off = 5;
 }
 
 /* clean up a socket, don't bother freeing anything if the program is stopping */
 static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
+    DBG("cleaning up sock @ %p", sock);
     if (sock->status != TCP_SYN_SENT) {
         struct tcphdr buf = {
             .th_flags = sock->status == TCP_ESTABLISHED ? TH_FIN : TH_RST
@@ -145,15 +147,15 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
         } else if ((size_t)sz != sizeof(buf)) {
             fprintf(stderr, "send %s our packet: tried %lu, sent %zd\n", (size_t)sz > sizeof(buf) ? "expanded" : "truncated", sizeof(buf), sz);
         }
-
-        return;
     }
 
-    if (!stopping) {
+    if (!stopping || free_mem_on_exit) {
+        DBG("freeing associated resources");
         free_port(sock->rsock->used_ports, sock->l_port);
         ev_timer_stop(EV_A_ &sock->tm_w);
 
         HASH_DELETE(hh_lp, sock->rsock->o_socks_by_lport, sock);
+        HASH_DELETE(hh_ca, sock->rsock->c_data->o_socks_by_caddr, sock);
 
         if (!sock->rsock->o_socks_by_lport) {
             close(sock->rsock->fd);
@@ -162,7 +164,6 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
 
             HASH_DEL(sock->rsock->c_data->o_rsocks, sock->rsock);
 
-            free(sock->rsock->r_addr);
             free(sock->rsock);
         }
 
@@ -236,7 +237,7 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
 
         char *rptr = rbuf;
 
-        if (rsock->r_addr->sa_family == AF_INET) {
+        if (rsock->r_addr.ss_family == AF_INET) {
             if ((size_t)rsz < sizeof(struct iphdr)) {
                 DBG("packet is smaller than IP header, ignoring");
                 return;
@@ -324,7 +325,7 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
             should_ssz = rsz - rhdr->th_off * 32 / CHAR_BIT;
             if (should_ssz > 0) {
                 DBG("sending %zd bytes to client", should_ssz);
-                ssz = sendto(rsock->c_data->s_sock, rptr + rhdr->th_off * 32 / CHAR_BIT, should_ssz, 0, sock->c_address, rsock->c_data->s_addrlen);
+                ssz = sendto(rsock->c_data->s_sock, rptr + rhdr->th_off * 32 / CHAR_BIT, should_ssz, 0, (struct sockaddr *)&sock->c_address, rsock->c_data->s_addrlen);
 
                 if (ssz < 0) {
                     perror("sendto");
@@ -348,20 +349,19 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
     struct o_c_rsock *rsock;
     rsock = malloc(sizeof(*rsock));
     memset(&rsock->used_ports, 0, sizeof(rsock->used_ports));
-    rsock->r_addr = malloc(res->ai_addrlen);
 
-    memcpy(rsock->r_addr, res->ai_addr, res->ai_addrlen);
+    memcpy(&rsock->r_addr, res->ai_addr, res->ai_addrlen);
     rsock->r_addrlen = res->ai_addrlen;
     freeaddrinfo(res);
     rsock->o_socks_by_lport = NULL;
 
-    rsock->fd = socket(rsock->r_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
+    rsock->fd = socket(rsock->r_addr.ss_family, SOCK_RAW, IPPROTO_TCP);
     if (!rsock->fd) {
         perror("socket");
         return NULL;
     }
 
-    if (connect(rsock->fd, rsock->r_addr, rsock->r_addrlen) == -1) {
+    if (connect(rsock->fd, (struct sockaddr *)&rsock->r_addr, rsock->r_addrlen) == -1) {
         perror("connect");
         return NULL;
     }
@@ -381,12 +381,12 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
 
     char proto[] = { 0, IPPROTO_TCP };
 
-    if (rsock->r_addr->sa_family != our_addr.ss_family)
+    if (rsock->r_addr.ss_family != our_addr.ss_family)
         abort();
 
     rsock->csum_p = csum_partial(proto, sizeof(proto),
             csum_sockaddr_partial((struct sockaddr *)&our_addr, 0,
-            csum_sockaddr_partial(rsock->r_addr, 1, 0)));
+            csum_sockaddr_partial((struct sockaddr *)&rsock->r_addr, 1, 0)));
 
     return rsock;
 }
@@ -422,8 +422,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                 return;
             }
 
-            sock->c_address = malloc(addresslen);
-            memcpy(sock->c_address, &c_data->pkt_addr, addresslen);
+            memcpy(&sock->c_address, &c_data->pkt_addr, addresslen);
 
             HASH_FIND(hh, c_data->o_rsocks, res->ai_addr, res->ai_addrlen, sock->rsock);
 
@@ -440,7 +439,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                 sock->rsock->io_w.data = sock->rsock;
                 ev_io_start(EV_A_ &sock->rsock->io_w);
 
-                HASH_ADD_KEYPTR(hh, c_data->o_rsocks, sock->rsock->r_addr, sock->rsock->r_addrlen, sock->rsock);
+                HASH_ADD(hh, c_data->o_rsocks, r_addr, sock->rsock->r_addrlen, sock->rsock);
             }
 
             uint16_t l_port = reserve_port(sock->rsock->used_ports);
@@ -455,7 +454,7 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
             sock->csum_p = csum_partial(&sock->l_port, sizeof(in_port_t), sock->rsock->csum_p);
 
-            HASH_ADD_KEYPTR(hh_ca, c_data->o_socks_by_caddr, sock->c_address, addresslen, sock);
+            HASH_ADD(hh_ca, c_data->o_socks_by_caddr, c_address, addresslen, sock);
             HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
 
             sock->seq_num = random();
@@ -526,18 +525,17 @@ static void c_cleanup() {
         return;
 
     DBG("cleaning up");
-    struct o_c_sock *sock;
-    for (sock = global_c_data->o_socks_by_caddr; sock != NULL; sock = sock->hh_ca.next) {
-        switch (sock->status) {
-        case TCP_CLOSE:
-            break;
-        default:
-            c_sock_cleanup(EV_DEFAULT, sock, 1);
-        }
-        // don't bother freeing anything because we're about to exit anyways
+    struct o_c_sock *sock, *tmp;
+    HASH_ITER(hh_ca, global_c_data->o_socks_by_caddr, sock, tmp) {
+        c_sock_cleanup(EV_DEFAULT, sock, 1);
     }
 
     global_c_data = NULL;
+}
+
+static void c_finish(EV_P_ ev_signal *w __attribute__((unused)), int revents __attribute__((unused))) {
+    c_cleanup();
+    ev_break(EV_A_ EVBREAK_ALL);
 }
 
 int start_client(const char *s_host, const char *s_port, const char *r_host, const char *r_port) {
@@ -577,15 +575,24 @@ int start_client(const char *s_host, const char *s_port, const char *r_host, con
 
     struct ev_loop *loop = EV_DEFAULT;
     ev_io s_watcher;
+    ev_signal iwatcher, twatcher;
 
     s_watcher.data = &c_data;
 
     ev_io_init(&s_watcher, cs_cb, c_data.s_sock, EV_READ);
     ev_io_start(loop, &s_watcher);
+    ev_signal_init(&iwatcher, c_finish, SIGINT);
+    ev_signal_start(loop, &iwatcher);
+    ev_signal_init(&twatcher, c_finish, SIGTERM);
+    ev_signal_start(loop, &twatcher);
 
     DBG("initialization complete, starting event loop");
     r = ev_run(loop, 0);
 
     c_cleanup();
+
+    if (free_mem_on_exit)
+        ev_loop_destroy(loop);
+
     return r;
 }

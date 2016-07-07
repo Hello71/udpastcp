@@ -1,7 +1,6 @@
-#include <netinet/in.h>
-#include <stdarg.h>
 #include <stdint.h>
-#include <stdlib.h>
+
+struct sockaddr;
 
 /* calculates the checksum of len bytes at buff when combined with wsum.
  * return value is already in network order, but must be inverted before
