@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,7 +12,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
 #include "common.h"
+#include "checksum.h"
 #include "server.h"
 #include "uthash.h"
 
@@ -23,6 +26,7 @@ struct o_s_sock {
     UT_hash_handle hh;
     int c_sock;
     uint16_t seq_num;
+    uint16_t csum_p;
     uint8_t status;
 };
 
@@ -34,6 +38,7 @@ struct s_data {
     struct o_s_sock *o_socks_by_caddr;
     int s_sock;
     socklen_t s_addrlen;
+    uint16_t csum_p;
 };
 
 static inline void s_prep_c_addr(struct o_s_sock *sock, struct tcphdr *hdr) {
@@ -153,6 +158,22 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         if (c_addrlen != s_data->s_addrlen)
             abort();
 
+        char *rptr = rbuf;
+
+        if (s_data->s_addr->sa_family == AF_INET) {
+            if ((size_t)sz < sizeof(struct iphdr)) {
+                DBG("packet is smaller than IP header, ignoring");
+                return;
+            }
+
+            if (((struct iphdr *)rbuf)->protocol != IPPROTO_TCP)
+                abort();
+
+            uint32_t ihl = ((struct iphdr *)rbuf)->ihl * 4;
+            rptr = rbuf + ihl;
+            sz -= ihl;
+        }
+
 #ifdef DEBUG
         char hbuf[NI_MAXHOST];
         r = getnameinfo((struct sockaddr *)&s_data->pkt_addr, c_addrlen, hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
@@ -161,7 +182,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             ev_break(EV_A_ EVBREAK_ONE);
             return;
         }
-        DBG("received %zd bytes from %s", sz, hbuf);
+        DBG("received %zd payload bytes from %s", sz, hbuf);
 #endif
 
         if ((size_t)sz < sizeof(struct tcphdr)) {
@@ -169,7 +190,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             return;
         }
 
-        struct tcphdr *tcphdr = (struct tcphdr *)rbuf;
+        struct tcphdr *tcphdr = (struct tcphdr *)rptr;
 
         DBG("packet received on port %hu", ntohs(tcphdr->th_dport));
 
@@ -201,6 +222,8 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                 sock->c_sock = -1;
                 sock->status = TCP_SYN_RECV;
 
+                sock->csum_p = csum_sockaddr_partial((struct sockaddr *)&s_data->pkt_addr, 1, s_data->csum_p);
+
                 struct tcphdr buf = {
                     .th_sport = tcphdr->th_dport,
                     .th_dport = tcphdr->th_sport,
@@ -209,6 +232,9 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
                     .th_flags = TH_SYN | TH_ACK,
                     .th_off = 5
                 };
+
+                uint16_t tsz = htons(sizeof(buf));
+                buf.th_sum = ~csum_partial(&buf.th_seq, 16, csum_partial(&tsz, sizeof(tsz), sock->csum_p));
 
                 HASH_ADD(hh, s_data->o_socks_by_caddr, c_addr, c_addrlen, sock);
 
@@ -239,11 +265,13 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             return;
         }
 
+        /*
         if (th_flags == TH_RST) {
             DBG("RST received, cleaning up socket");
             sock->status = TCP_CLOSE;
             s_sock_cleanup(EV_A_ sock);
         }
+        */
 
         if (th_flags & ~(TH_PUSH | TH_ACK)) {
             DBG("TCP flags not PSH and/or ACK, dropping packet");
@@ -297,7 +325,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
         assert(sock->status == TCP_ESTABLISHED);
 
         DBG("sending %zu bytes to client", (size_t)(sz - tcphdr->th_off * 4));
-        sz = send(sock->c_sock, rbuf + tcphdr->th_off * 4, sz - tcphdr->th_off * 4, 0);
+        sz = send(sock->c_sock, rptr + tcphdr->th_off * 4, sz - tcphdr->th_off * 4, 0);
         if (sz < 0) {
             perror("send");
             ev_break(EV_A_ EVBREAK_ONE);
@@ -323,11 +351,15 @@ int start_server(const char *s_host, const char *s_port, const char *r_host, con
         return 1;
     }
 
+    char proto[] = { 0, IPPROTO_TCP };
+
     struct s_data s_data = {
         .s_addr = res->ai_addr,
         .s_addrlen = res->ai_addrlen,
         .r_host = r_host,
-        .r_port = r_port
+        .r_port = r_port,
+        .csum_p = csum_sockaddr_partial(res->ai_addr, 1,
+                csum_partial(&proto, sizeof(proto), 0))
     };
 
     s_data.s_sock = socket(s_data.s_addr->sa_family, SOCK_RAW, IPPROTO_TCP);
@@ -335,6 +367,11 @@ int start_server(const char *s_host, const char *s_port, const char *r_host, con
         perror("socket");
         freeaddrinfo(res);
         return 1;
+    }
+
+    if (bind(s_data.s_sock, res->ai_addr, res->ai_addrlen) == -1) {
+        perror("bind");
+        return 2;
     }
 
     if (fcntl(s_data.s_sock, F_SETFL, O_NONBLOCK) == -1) {

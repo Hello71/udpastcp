@@ -3,3 +3,5 @@
 #else
 #define DBG(...)
 #endif
+
+#define IN_ADDR_PORT(addr) (((struct sockaddr_in *)addr)->sin_port)

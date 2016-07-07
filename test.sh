@@ -1,17 +1,17 @@
 #!/bin/sh
 # this script tests basic udpastcp functionality.
 
-test1() {
+test_bidi() {
     (
         pids=
         trap 'kill $pids' EXIT
-        ./udpastcp client localhost 36563 localhost 64109 &
+        ./udpastcp client "$1" 36563 "$1" 64109 &
         pids="$!"
-        ./udpastcp server localhost 64109 localhost 41465 &
+        ./udpastcp server "$1" 64109 "$1" 41465 &
         pids="$pids $!"
-        ( ( sleep 0.4; echo BBBBBBBB; ) | socat udp6-listen:41465 - ) &
+        ( ( sleep 0.4; echo BBBBBBBB; ) | socat "udp-listen:41465,pf=${2}" - ) &
         pids="$pids $!"
-        ( ( sleep 0.2; echo AAAAAAAA; ) | socat - 'udp-connect:[::1]:36563' ) &
+        ( ( sleep 0.2; echo AAAAAAAA; ) | socat - "udp-connect:localhost:36563,pf=${2}" ) &
         pids="$pids $!"
         sleep 0.5
     )
@@ -20,9 +20,18 @@ test1() {
 nl='
 '
 
-if [ "$( test1 )" = "AAAAAAAA${nl}BBBBBBBB" ]; then
-    echo "Test succeeded."
+if [ "$( test_bidi 127.0.0.1 ip4 )" = "AAAAAAAA${nl}BBBBBBBB" ]; then
+    echo "IPv4 test succeeded."
 else
-    echo "Test failed."
-    exit 1
+    echo "IPv4 test failed."
+    r=1
 fi
+
+if [ "$( test_bidi ::1 ip6 )" = "AAAAAAAA${nl}BBBBBBBB" ]; then
+    echo "IPv6 test succeeded."
+else
+    echo "IPv6 test failed."
+    r=1
+fi
+
+exit $r

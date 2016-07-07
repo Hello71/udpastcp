@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,8 +20,6 @@
 #include "uthash.h"
 
 #define PORTS_IN_INT (sizeof(int) * CHAR_BIT)
-
-#define IN_ADDR_PORT(addr) (((struct sockaddr_in *)addr)->sin_port)
 
 struct c_data {
     const char *r_host;
@@ -229,14 +228,31 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
 
     while ((rsz = recvfrom(w->fd, rbuf, sizeof(rbuf), 0, (struct sockaddr *)&rsock->c_data->pkt_addr, &pkt_addrlen)) != -1) {
         DBG("received %zd raw bytes on client", rsz);
+        DBG("%u %zu", pkt_addrlen, sizeof(struct sockaddr_in6));
 
         if (pkt_addrlen > sizeof(struct sockaddr_in6))
             abort();
 
+        char *rptr = rbuf;
+
+        if (rsock->r_addr->sa_family == AF_INET) {
+            if ((size_t)rsz < sizeof(struct iphdr)) {
+                DBG("packet is smaller than IP header, ignoring");
+                return;
+            }
+
+            if (((struct iphdr *)rptr)->protocol != IPPROTO_TCP)
+                abort();
+
+            uint32_t ihl = ((struct iphdr *)rptr)->ihl * 4;
+            rptr = rptr + ihl;
+            rsz -= ihl;
+        }
+
         if ((size_t)rsz < sizeof(struct tcphdr))
             return;
 
-        struct tcphdr *rhdr = (struct tcphdr *)rbuf;
+        struct tcphdr *rhdr = (struct tcphdr *)rptr;
 
         struct o_c_sock *sock;
 
@@ -307,7 +323,7 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
             should_ssz = rsz - rhdr->th_off * 32 / CHAR_BIT;
             if (should_ssz > 0) {
                 DBG("sending %zd bytes to client", should_ssz);
-                ssz = sendto(rsock->c_data->s_sock, rbuf + rhdr->th_off * 32 / CHAR_BIT, should_ssz, 0, sock->c_address, rsock->c_data->s_addrlen);
+                ssz = sendto(rsock->c_data->s_sock, rptr + rhdr->th_off * 32 / CHAR_BIT, should_ssz, 0, sock->c_address, rsock->c_data->s_addrlen);
 
                 if (ssz < 0) {
                     perror("sendto");
@@ -367,25 +383,9 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
     if (rsock->r_addr->sa_family != our_addr.ss_family)
         abort();
 
-    size_t addr_offset, addr_size;
-
-    switch (our_addr.ss_family) {
-    case AF_INET:
-        addr_offset = offsetof(struct sockaddr_in, sin_addr);
-        addr_size = sizeof(in_addr_t);
-        break;
-    case AF_INET6:
-        addr_offset = offsetof(struct sockaddr_in6, sin6_addr);
-        addr_size = sizeof(struct in6_addr);
-        break;
-    default:
-        abort();
-    }
-
-    rsock->csum_p = csum_partial(&IN_ADDR_PORT(rsock->r_addr), sizeof(in_port_t),
-            csum_partial(proto, sizeof(proto),
-            csum_partial((char *)&our_addr + addr_offset, addr_size,
-            csum_partial((char *)rsock->r_addr + addr_offset, addr_size, 0))));
+    rsock->csum_p = csum_partial(proto, sizeof(proto),
+            csum_sockaddr_partial((struct sockaddr *)&our_addr, 0,
+            csum_sockaddr_partial(rsock->r_addr, 1, 0)));
 
     return rsock;
 }

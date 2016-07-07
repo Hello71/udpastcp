@@ -33,6 +33,7 @@
 
 #include <assert.h>
 #include <endian.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include "checksum.h"
 
@@ -126,4 +127,19 @@ uint16_t csum_partial(const void *buff, int len, uint16_t wsum)
 	if (sum > result)
 		result += 1;
 	return result;
+}
+
+uint16_t csum_sockaddr_partial(const struct sockaddr *addr, int incl_port, uint16_t wsum)
+{
+    if (incl_port)
+        wsum = csum_partial(&((struct sockaddr_in *)addr)->sin_port, sizeof(in_port_t), wsum);
+
+    switch (addr->sa_family) {
+    case AF_INET:
+        return csum_partial(&((struct sockaddr_in *)addr)->sin_addr, sizeof(struct in_addr), wsum);
+    case AF_INET6:
+        return csum_partial(&((struct sockaddr_in6 *)addr)->sin6_addr, sizeof(struct in6_addr), wsum);
+    default:
+        abort();
+    }
 }
