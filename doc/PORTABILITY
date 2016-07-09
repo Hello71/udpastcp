@@ -1,6 +1,5 @@
-Most C99 + POSIX systems should be supported. Windows is not, since it does not
-support Unix-style events, and (although this is a minor concern) it does not
-support sendmsg and recvmsg.
+Most C99 + POSIX systems should be supported. Windows is not supported yet
+because Microsoft has blocked sending TCP through raw sockets.
 
 In addition, since this program depends on libev, the portability requirements
 of libev must be satisfied:

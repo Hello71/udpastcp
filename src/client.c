@@ -230,7 +230,6 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
 
     while ((rsz = recvfrom(w->fd, rbuf, sizeof(rbuf), 0, (struct sockaddr *)&rsock->c_data->pkt_addr, &pkt_addrlen)) != -1) {
         DBG("received %zd raw bytes on client", rsz);
-        DBG("%u %zu", pkt_addrlen, sizeof(struct sockaddr_in6));
 
         if (pkt_addrlen > sizeof(struct sockaddr_in6))
             abort();

@@ -1,3 +1,5 @@
+- add pcap receiving support
+
 - verify checksums
 
 - add LD_PRELOAD support
@@ -8,7 +10,7 @@
 
 - change some of the tiny hash tables to linked lists
 
-- add pcap support
+- add pcap sending support
 
 - add fake TCP options
 
