@@ -11,7 +11,12 @@ libev. If desired, it should be easily portable to use libevent instead, as it
 uses only basic event-based programming concepts.
 
 Example usage:
-    server# openvpn --proto udp --port 1194
-    server# udpintcp server localhost 11940 localhost 1194
-    client# udpintcp client localhost 1194 server 11940
-    client# openvpn --remote localhost 11940 udp
+    # gmake
+    [ ... ]
+    # ./test.sh
+    IPv4 test succeeded.
+    IPv6 test succeeded.
+    server# openvpn --config ... --proto udp6 --local ::1
+    server# udpintcp server server 11940 ::1 1194
+    client# udpintcp client ::1 1194 server 11940
+    client# openvpn --config ... --proto udp6 --remote ::1 11940
