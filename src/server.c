@@ -19,6 +19,17 @@
 #include "server.h"
 #include "uthash.h"
 
+struct s_data {
+    struct sockaddr *s_addr;
+    struct sockaddr_storage pkt_addr;
+    const char *r_host;
+    const char *r_port;
+    struct o_s_sock *o_socks_by_caddr;
+    int s_sock;
+    socklen_t s_addrlen;
+    uint16_t csum_p;
+};
+
 struct o_s_sock {
     struct s_data *s_data;
     struct sockaddr_storage c_addr;
@@ -29,17 +40,6 @@ struct o_s_sock {
     uint16_t seq_num;
     uint16_t csum_p;
     uint8_t status;
-};
-
-struct s_data {
-    struct sockaddr *s_addr;
-    struct sockaddr_storage pkt_addr;
-    const char *r_host;
-    const char *r_port;
-    struct o_s_sock *o_socks_by_caddr;
-    int s_sock;
-    socklen_t s_addrlen;
-    uint16_t csum_p;
 };
 
 struct s_data *global_s_data;

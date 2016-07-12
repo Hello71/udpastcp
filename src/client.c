@@ -29,7 +29,6 @@ struct c_data {
     struct o_c_rsock *o_rsocks;
     struct sockaddr_storage pkt_addr;
     int s_sock;
-    int i_sock;
     socklen_t s_addrlen;
 };
 
@@ -154,6 +153,9 @@ static void c_sock_cleanup(EV_P_ struct o_c_sock *sock, int stopping) {
         free_port(sock->rsock->used_ports, sock->l_port);
         ev_timer_stop(EV_A_ &sock->tm_w);
 
+        if (sock->status == TCP_SYN_SENT)
+            free(sock->pending_data);
+
         HASH_DELETE(hh_lp, sock->rsock->o_socks_by_lport, sock);
         HASH_DELETE(hh_ca, sock->rsock->c_data->o_socks_by_caddr, sock);
 
@@ -266,6 +268,7 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
 
         if (sock->status == TCP_SYN_SENT && rhdr->th_flags == (TH_SYN | TH_ACK)) {
             DBG("SYN/ACK received, connection established");
+            assert(sock->pending_data);
 
             sock->status = TCP_ESTABLISHED;
 
@@ -305,6 +308,9 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
             }
 
             free(sock->pending_data);
+#ifndef NDEBUG
+            sock->pending_data = NULL;
+#endif
 
             ev_timer_stop(EV_A_ &sock->tm_w);
             // this delay is not very important because one, it is OK if UDP
@@ -343,10 +349,12 @@ static void cc_cb(struct ev_loop *loop, ev_io *w, int revents __attribute__((unu
     }
 }
 
-/* initialize new raw socket */
-static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
+/* initialize new raw socket. res is invalid after returning from this function. */
+static inline struct o_c_rsock * c_rsock_init(EV_P_ struct addrinfo *res) {
     struct o_c_rsock *rsock;
     rsock = malloc(sizeof(*rsock));
+    if (!rsock)
+        abort();
     memset(&rsock->used_ports, 0, sizeof(rsock->used_ports));
 
     memcpy(&rsock->r_addr, res->ai_addr, res->ai_addrlen);
@@ -357,17 +365,17 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
     rsock->fd = socket(rsock->r_addr.ss_family, SOCK_RAW, IPPROTO_TCP);
     if (!rsock->fd) {
         perror("socket");
-        return NULL;
+        goto err;
     }
 
     if (connect(rsock->fd, (struct sockaddr *)&rsock->r_addr, rsock->r_addrlen) == -1) {
         perror("connect");
-        return NULL;
+        goto err;
     }
 
     if (fcntl(rsock->fd, F_SETFL, O_NONBLOCK) == -1) {
         perror("fcntl");
-        return NULL;
+        goto err;
     }
 
     struct sockaddr_storage our_addr;
@@ -375,7 +383,7 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
     int r = getsockname(rsock->fd, (struct sockaddr *)&our_addr, &our_addr_len);
     if (r == -1) {
         perror("getsockname");
-        return NULL;
+        goto err;
     }
 
     char proto[] = { 0, IPPROTO_TCP };
@@ -387,7 +395,75 @@ static inline struct o_c_rsock * c_rsock_init(struct addrinfo *res) {
             csum_sockaddr_partial((struct sockaddr *)&our_addr, 0,
             csum_sockaddr_partial((struct sockaddr *)&rsock->r_addr, 1, 0)));
 
+    ev_io_init(&rsock->io_w, cc_cb, rsock->fd, EV_READ);
+    rsock->io_w.data = rsock;
+    ev_io_start(EV_A_ &rsock->io_w);
+
     return rsock;
+
+err:
+    free(rsock);
+    return NULL;
+}
+
+static inline struct o_c_sock * c_sock_init(EV_P_ struct c_data *c_data) {
+    struct o_c_sock *sock = NULL;
+
+    struct addrinfo *res;
+    DBG("looking up [%s]:%s", c_data->r_host, c_data->r_port);
+    // TODO: make this asynchronous
+    int r = getaddrinfo(c_data->r_host, c_data->r_port, NULL, &res);
+    if (r) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
+        goto err;
+    }
+
+    sock = malloc(sizeof(struct o_c_sock));
+    if (!sock)
+        abort();
+
+    memcpy(&sock->c_address, &c_data->pkt_addr, c_data->s_addrlen);
+
+    HASH_FIND(hh, c_data->o_rsocks, res->ai_addr, res->ai_addrlen, sock->rsock);
+
+    if (!sock->rsock) {
+        DBG("could not locate remote socket to host, initializing new raw socket");
+        sock->rsock = c_rsock_init(EV_A_ res);
+        if (!sock->rsock) {
+            goto err;
+        }
+        sock->rsock->c_data = c_data;
+
+        HASH_ADD(hh, c_data->o_rsocks, r_addr, sock->rsock->r_addrlen, sock->rsock);
+    }
+
+    uint16_t l_port = reserve_port(sock->rsock->used_ports);
+    assert(l_port >= 32768);
+    DBG("using port %hu", l_port);
+    if (!l_port) {
+        fputs("we ran out of ports?\n", stderr);
+        goto err;
+    }
+    sock->l_port = htons(l_port);
+
+    sock->csum_p = csum_partial(&sock->l_port, sizeof(in_port_t), sock->rsock->csum_p);
+
+    HASH_ADD(hh_ca, c_data->o_socks_by_caddr, c_address, c_data->s_addrlen, sock);
+    HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
+
+    sock->seq_num = random();
+
+    ev_init(&sock->tm_w, c_syn_tm_cb);
+    sock->tm_w.data = sock;
+
+    sock->syn_retries = 0;
+
+    sock->status = TCP_SYN_SENT;
+    return sock;
+
+err:
+    free(sock);
+    return NULL;
 }
 
 /* client UDP socket callback */
@@ -409,66 +485,18 @@ static void cs_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
 
         if (!sock) {
             DBG("could not locate matching socket for client, initializing new connection");
-            sock = calloc(1, sizeof(*sock));
-
-            struct addrinfo *res;
-            DBG("looking up [%s]:%s", c_data->r_host, c_data->r_port);
-            // TODO: make this asynchronous
-            int r = getaddrinfo(c_data->r_host, c_data->r_port, NULL, &res);
-            if (r) {
-                fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
+            sock = c_sock_init(EV_A_ c_data);
+            if (!sock) {
                 ev_break(EV_A_ EVBREAK_ONE);
                 return;
             }
-
-            memcpy(&sock->c_address, &c_data->pkt_addr, addresslen);
-
-            HASH_FIND(hh, c_data->o_rsocks, res->ai_addr, res->ai_addrlen, sock->rsock);
-
-            if (!sock->rsock) {
-                DBG("could not locate remote socket to host, initializing new raw socket");
-                sock->rsock = c_rsock_init(res);
-                if (!sock->rsock) {
-                    ev_break(EV_A_ EVBREAK_ONE);
-                    return;
-                }
-                sock->rsock->c_data = c_data;
-
-                ev_io_init(&sock->rsock->io_w, cc_cb, sock->rsock->fd, EV_READ);
-                sock->rsock->io_w.data = sock->rsock;
-                ev_io_start(EV_A_ &sock->rsock->io_w);
-
-                HASH_ADD(hh, c_data->o_rsocks, r_addr, sock->rsock->r_addrlen, sock->rsock);
-            }
-
-            uint16_t l_port = reserve_port(sock->rsock->used_ports);
-            assert(l_port >= 32768);
-            DBG("using port %hu", l_port);
-            if (!l_port) {
-                fputs("we ran out of ports?\n", stderr);
-                ev_break(EV_A_ EVBREAK_ONE);
-                return;
-            }
-            sock->l_port = htons(l_port);
-
-            sock->csum_p = csum_partial(&sock->l_port, sizeof(in_port_t), sock->rsock->csum_p);
-
-            HASH_ADD(hh_ca, c_data->o_socks_by_caddr, c_address, addresslen, sock);
-            HASH_ADD(hh_lp, sock->rsock->o_socks_by_lport, l_port, sizeof(in_port_t), sock);
-
-            sock->seq_num = random();
-
-            sock->pending_data = malloc(sz);
-            memcpy(sock->pending_data, rbuf, sz);
-            sock->pending_data_size = sz;
-
-            ev_init(&sock->tm_w, c_syn_tm_cb);
-            sock->tm_w.data = sock;
-
-            sock->syn_retries = 0;
             c_adv_syn_tm(EV_A_ sock);
 
-            sock->status = TCP_SYN_SENT;
+            sock->pending_data = malloc(sz);
+            if (!sock->pending_data)
+                abort();
+            memcpy(sock->pending_data, rbuf, sz);
+            sock->pending_data_size = sz;
 
             return;
         }
