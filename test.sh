@@ -7,9 +7,9 @@ test_bidi() {
     (
         pids=
         trap 'kill $pids' INT TERM EXIT
-        $UDPASTCP client "$1" 36563 "$1" 64109 &
+        $UDPASTCP -m client -h "$1" -p 36563 -H "$1" -P 64109 &
         pids="$!"
-        $UDPASTCP server "$1" 64109 "$1" 41465 &
+        $UDPASTCP -m server -h "$1" -p 64109 -H "$1" -P 41465 &
         pids="$pids $!"
         ( ( sleep 0.5; echo BBBBBBBB; ) | socat "udp-listen:41465,pf=${2}" - ) &
         pids="$pids $!"

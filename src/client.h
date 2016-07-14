@@ -1,1 +1,6 @@
-int start_client(const char *s_host, const char *s_port, const char *r_host, const char *r_port);
+#ifndef CLIENT_H
+#define CLIENT_H
+#include "common.h"
+
+int start_client(const struct common_data *);
+#endif

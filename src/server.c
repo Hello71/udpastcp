@@ -20,10 +20,9 @@
 #include "uthash.h"
 
 struct s_data {
+    const struct common_data *common_data;
     struct sockaddr *s_addr;
     struct sockaddr_storage pkt_addr;
-    const char *r_host;
-    const char *r_port;
     struct o_s_sock *o_socks_by_caddr;
     int s_sock;
     socklen_t s_addrlen;
@@ -299,7 +298,7 @@ static void ss_cb(EV_P_ ev_io *w, int revents __attribute__((unused))) {
             sock->status = TCP_ESTABLISHED;
 
             struct addrinfo *res;
-            r = getaddrinfo(s_data->r_host, s_data->r_port, NULL, &res);
+            r = getaddrinfo(s_data->common_data->remote_host, s_data->common_data->remote_port, NULL, &res);
             if (r) {
                 fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
                 ev_break(EV_A_ EVBREAK_ONE);
@@ -375,9 +374,9 @@ static void s_finish(EV_P_ ev_signal *w __attribute__((unused)), int revents __a
     ev_break(EV_A_ EVBREAK_ALL);
 }
 
-int start_server(const char *s_host, const char *s_port, const char *r_host, const char *r_port) {
+int start_server(const struct common_data *common_data) {
     struct addrinfo *res;
-    int r = getaddrinfo(s_host, s_port, NULL, &res);
+    int r = getaddrinfo(common_data->listen_host, common_data->listen_port, NULL, &res);
     if (r) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
         return 1;
@@ -386,10 +385,9 @@ int start_server(const char *s_host, const char *s_port, const char *r_host, con
     char proto[] = { 0, IPPROTO_TCP };
 
     struct s_data s_data = {
+        .common_data = common_data,
         .s_addr = res->ai_addr,
         .s_addrlen = res->ai_addrlen,
-        .r_host = r_host,
-        .r_port = r_port,
         .csum_p = csum_sockaddr_partial(res->ai_addr, 1,
                 csum_partial(&proto, sizeof(proto), 0))
     };

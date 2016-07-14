@@ -23,8 +23,7 @@
 #define PORTS_IN_INT (sizeof(int) * CHAR_BIT)
 
 struct c_data {
-    const char *r_host;
-    const char *r_port;
+    const struct common_data *common_data;
     struct o_c_sock *o_socks_by_caddr;
     struct o_c_rsock *o_rsocks;
     struct sockaddr_storage pkt_addr;
@@ -410,9 +409,9 @@ static inline struct o_c_sock * c_sock_init(EV_P_ struct c_data *c_data) {
     struct o_c_sock *sock = NULL;
 
     struct addrinfo *res;
-    DBG("looking up [%s]:%s", c_data->r_host, c_data->r_port);
+    DBG("looking up [%s]:%s", c_data->common_data->remote_host, c_data->common_data->remote_port);
     // TODO: make this asynchronous
-    int r = getaddrinfo(c_data->r_host, c_data->r_port, NULL, &res);
+    int r = getaddrinfo(c_data->common_data->remote_host, c_data->common_data->remote_port, NULL, &res);
     if (r) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
         goto err;
@@ -565,18 +564,17 @@ static void c_finish(EV_P_ ev_signal *w __attribute__((unused)), int revents __a
     ev_break(EV_A_ EVBREAK_ALL);
 }
 
-int start_client(const char *s_host, const char *s_port, const char *r_host, const char *r_port) {
+int start_client(const struct common_data *common_data) {
     struct addrinfo *res;
-    int r = getaddrinfo(s_host, s_port, NULL, &res);
+    int r = getaddrinfo(common_data->listen_host, common_data->listen_port, NULL, &res);
     if (r) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(r));
         return 3;
     }
 
     struct c_data c_data = {
-        .s_addrlen = res->ai_addrlen,
-        .r_host = r_host,
-        .r_port = r_port
+        .common_data = common_data,
+        .s_addrlen = res->ai_addrlen
     };
 
     c_data.s_sock = socket(res->ai_family, SOCK_DGRAM, 0);
@@ -597,12 +595,12 @@ int start_client(const char *s_host, const char *s_port, const char *r_host, con
         return 4;
     }
 
-    global_c_data = &c_data;
-    atexit(c_cleanup);
-
     struct ev_loop *loop = EV_DEFAULT;
     ev_io s_watcher;
     ev_signal iwatcher, twatcher;
+
+    global_c_data = &c_data;
+    atexit(c_cleanup);
 
     s_watcher.data = &c_data;
 

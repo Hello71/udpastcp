@@ -1,3 +1,6 @@
+#ifndef CHECKSUM_H
+#define CHECKSUM_H
+
 #include <stdint.h>
 
 struct sockaddr;
@@ -14,3 +17,5 @@ uint16_t csum_partial(const void *buff, int len, uint16_t wsum);
  * otherwise identical to csum_partial.
  */
 uint16_t csum_sockaddr_partial(const struct sockaddr *addr, int incl_port, uint16_t wsum);
+
+#endif

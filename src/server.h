@@ -1,1 +1,8 @@
-int start_server(const char *s_addr, const char *s_port, const char *r_addr, const char *r_port);
+#ifndef SERVER_H
+#define SERVER_H
+
+#include "common.h"
+
+int start_server(const struct common_data *);
+
+#endif
