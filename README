@@ -1,3 +1,5 @@
+[This project is abandoned, see the end of this README for more information.]
+
 This program hides UDP traffic as TCP traffic in order to bypass certain
 firewalls.
 
@@ -20,3 +22,8 @@ Example usage:
     server# udpintcp server server 11940 ::1 1194
     client# udpintcp client ::1 1194 server 11940
     client# openvpn --config ... --proto udp6 --remote ::1 11940
+
+I've abandoned this project because I don't think it's that useful in practice,
+since meddling middleboxes tend to screw with the oddities required by UDP in
+TCP (no retransmissions, for one). For tunneling, SOCKS seems like a better
+solution, especially since QUIC is dead.
