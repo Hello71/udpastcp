@@ -1,4 +1,6 @@
-[This project is abandoned, see the end of this README for more information.]
+This project is incomplete, abandoned, and obsolete. Use https://github.com/wangyu-/udp2raw-tunnel instead.
+
+---
 
 This program hides UDP traffic as TCP traffic in order to bypass certain
 firewalls.
